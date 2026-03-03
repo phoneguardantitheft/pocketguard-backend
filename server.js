@@ -25,9 +25,9 @@ const configuration = new Configuration({
   baseOptions: {
     headers: {
       "PLAID-CLIENT-ID": PLAID_CLIENT_ID,
-      "PLAID-SECRET": PLAID_SECRET
-    }
-  }
+      "PLAID-SECRET": PLAID_SECRET,
+    },
+  },
 });
 
 const plaidClient = new PlaidApi(configuration);
@@ -38,7 +38,7 @@ const tokenStore = new Map(); // deviceId => { access_token, item_id }
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // 1) Create a link_token for Plaid Link
-app.post("/create_link_token", async (req, res) => {
+app.post("/plaid/create_link_token", async (req, res) => {
   try {
     const { deviceId } = req.body;
     if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
@@ -48,7 +48,7 @@ app.post("/create_link_token", async (req, res) => {
       client_name: "PocketGuard",
       products: ["transactions"],
       country_codes: ["US"],
-      language: "en"
+      language: "en",
     });
 
     res.json({ link_token: response.data.link_token });
@@ -59,7 +59,7 @@ app.post("/create_link_token", async (req, res) => {
 });
 
 // 2) Exchange public_token -> access_token
-app.post("/exchange_public_token", async (req, res) => {
+app.post("/plaid/exchange_public_token", async (req, res) => {
   try {
     const { deviceId, public_token } = req.body;
     if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
@@ -79,13 +79,15 @@ app.post("/exchange_public_token", async (req, res) => {
 });
 
 // 3) Fetch accounts + recent transactions
-app.post("/get_accounts_and_transactions", async (req, res) => {
+app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
   try {
     const { deviceId, startDate, endDate } = req.body;
     if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
 
     const record = tokenStore.get(deviceId);
-    if (!record?.access_token) return res.status(400).json({ error: "No linked bank for this deviceId" });
+    if (!record?.access_token) {
+      return res.status(400).json({ error: "No linked bank for this deviceId" });
+    }
 
     const access_token = record.access_token;
 
@@ -101,14 +103,14 @@ app.post("/get_accounts_and_transactions", async (req, res) => {
       access_token,
       start_date: start,
       end_date: end,
-      options: { count: 500, offset: 0 }
+      options: { count: 500, offset: 0 },
     });
 
     res.json({
       accounts: accountsResp.data.accounts,
       transactions: txResp.data.transactions,
       item: txResp.data.item,
-      dateRange: { start, end }
+      dateRange: { start, end },
     });
   } catch (err) {
     console.error(err?.response?.data || err);
@@ -117,7 +119,7 @@ app.post("/get_accounts_and_transactions", async (req, res) => {
 });
 
 // 4) Optional: Unlink
-app.post("/unlink", (req, res) => {
+app.post("/plaid/unlink", (req, res) => {
   const { deviceId } = req.body;
   if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
   tokenStore.delete(deviceId);
