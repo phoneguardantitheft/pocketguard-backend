@@ -43,12 +43,43 @@ const configuration = new Configuration({
 const plaidClient = new PlaidApi(configuration);
 
 // ---------- MVP storage ----------
-const tokenStore = new Map(); // deviceId => { access_token, item_id }
+// deviceId => [ { access_token, item_id, institution_name } ]
+const tokenStore = new Map();
+
+// ---------- Helpers ----------
+function getLinkedItems(deviceId) {
+  const items = tokenStore.get(deviceId);
+  return Array.isArray(items) ? items : [];
+}
+
+function setLinkedItems(deviceId, items) {
+  tokenStore.set(deviceId, items);
+}
+
+function dedupeAccounts(accounts) {
+  const seen = new Set();
+  return accounts.filter((acct) => {
+    const key = acct.account_id;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeTransactions(transactions) {
+  const seen = new Set();
+  return transactions.filter((txn) => {
+    const key = txn.transaction_id;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 // ---------- Health ----------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ---------- OAuth Redirect (Required for Chase / Wells Fargo etc) ----------
+// ---------- OAuth Redirect ----------
 app.get("/plaid/oauth", (req, res) => {
   console.log("Plaid OAuth redirect received:", req.query);
 
@@ -134,16 +165,60 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
     const access_token = exchange.data.access_token;
     const item_id = exchange.data.item_id;
 
-    tokenStore.set(deviceId, { access_token, item_id });
+    let institution_name = "Linked Bank";
 
-    res.json({ ok: true, item_id });
+    try {
+      const itemResp = await plaidClient.itemGet({ access_token });
+      const institutionId = itemResp.data.item.institution_id;
+
+      if (institutionId) {
+        const instResp = await plaidClient.institutionsGetById({
+          institution_id: institutionId,
+          country_codes: ["US"],
+        });
+
+        institution_name = instResp.data.institution.name || institution_name;
+      }
+    } catch (institutionErr) {
+      console.warn(
+        "Could not resolve institution name:",
+        institutionErr?.response?.data || institutionErr
+      );
+    }
+
+    const existingItems = getLinkedItems(deviceId);
+
+    const alreadyLinked = existingItems.some((item) => item.item_id === item_id);
+
+    let updatedItems;
+    if (alreadyLinked) {
+      updatedItems = existingItems.map((item) =>
+        item.item_id === item_id
+          ? { ...item, access_token, institution_name }
+          : item
+      );
+    } else {
+      updatedItems = [
+        ...existingItems,
+        { access_token, item_id, institution_name },
+      ];
+    }
+
+    setLinkedItems(deviceId, updatedItems);
+
+    res.json({
+      ok: true,
+      item_id,
+      institution_name,
+      linked_item_count: updatedItems.length,
+    });
   } catch (err) {
     console.error("exchange_public_token error:", err?.response?.data || err);
     res.status(500).json({ error: "Failed to exchange public token" });
   }
 });
 
-// ---------- 3) Fetch Accounts + Transactions ----------
+// ---------- 3) Fetch Accounts + Transactions from ALL linked banks ----------
 app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
   try {
     const { deviceId, startDate, endDate } = req.body;
@@ -152,42 +227,77 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       return res.status(400).json({ error: "Missing deviceId" });
     }
 
-    const record = tokenStore.get(deviceId);
+    const linkedItems = getLinkedItems(deviceId);
 
-    if (!record?.access_token) {
-      return res.status(400).json({ error: "No linked bank for this deviceId" });
+    if (linkedItems.length === 0) {
+      return res.status(400).json({ error: "No linked banks for this deviceId" });
     }
 
-    const access_token = record.access_token;
-
-    const accountsResp = await plaidClient.accountsGet({
-      access_token,
-    });
-
     const now = new Date();
-
     const end = endDate || now.toISOString().slice(0, 10);
-
     const start =
       startDate ||
-      new Date(now.getTime() - 90 * 86400 * 1000)
-        .toISOString()
-        .slice(0, 10);
+      new Date(now.getTime() - 90 * 86400 * 1000).toISOString().slice(0, 10);
 
-    const txResp = await plaidClient.transactionsGet({
-      access_token,
-      start_date: start,
-      end_date: end,
-      options: {
-        count: 500,
-        offset: 0,
-      },
+    const allAccounts = [];
+    const allTransactions = [];
+    const linkedInstitutions = [];
+
+    for (const linkedItem of linkedItems) {
+      const { access_token, item_id, institution_name } = linkedItem;
+
+      try {
+        const accountsResp = await plaidClient.accountsGet({
+          access_token,
+        });
+
+        const txResp = await plaidClient.transactionsGet({
+          access_token,
+          start_date: start,
+          end_date: end,
+          options: {
+            count: 500,
+            offset: 0,
+          },
+        });
+
+        const accountsWithInstitution = accountsResp.data.accounts.map((acct) => ({
+          ...acct,
+          institution_name,
+          linked_item_id: item_id,
+        }));
+
+        const transactionsWithInstitution = txResp.data.transactions.map((txn) => ({
+          ...txn,
+          institution_name,
+          linked_item_id: item_id,
+        }));
+
+        allAccounts.push(...accountsWithInstitution);
+        allTransactions.push(...transactionsWithInstitution);
+
+        linkedInstitutions.push({
+          item_id,
+          institution_name,
+          account_count: accountsResp.data.accounts.length,
+        });
+      } catch (itemErr) {
+        console.error(
+          `Error fetching data for item ${item_id}:`,
+          itemErr?.response?.data || itemErr
+        );
+      }
+    }
+
+    const uniqueAccounts = dedupeAccounts(allAccounts);
+    const uniqueTransactions = dedupeTransactions(allTransactions).sort((a, b) => {
+      return new Date(b.date) - new Date(a.date);
     });
 
     res.json({
-      accounts: accountsResp.data.accounts,
-      transactions: txResp.data.transactions,
-      item: txResp.data.item,
+      accounts: uniqueAccounts,
+      transactions: uniqueTransactions,
+      linkedInstitutions,
       dateRange: { start, end },
     });
   } catch (err) {
@@ -200,7 +310,27 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
   }
 });
 
-// ---------- 4) Unlink Bank ----------
+// ---------- 4) Debug: list linked banks for device ----------
+app.post("/plaid/list_linked_banks", (req, res) => {
+  const { deviceId } = req.body;
+
+  if (!deviceId) {
+    return res.status(400).json({ error: "Missing deviceId" });
+  }
+
+  const linkedItems = getLinkedItems(deviceId);
+
+  res.json({
+    ok: true,
+    linkedBanks: linkedItems.map((item) => ({
+      item_id: item.item_id,
+      institution_name: item.institution_name,
+    })),
+    count: linkedItems.length,
+  });
+});
+
+// ---------- 5) Unlink ALL banks ----------
 app.post("/plaid/unlink", (req, res) => {
   const { deviceId } = req.body;
 
