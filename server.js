@@ -338,9 +338,10 @@ app.post("/plaid/unlink", (req, res) => {
     return res.status(400).json({ error: "Missing deviceId" });
   }
 
+  const removedCount = getLinkedItems(deviceId).length;
   tokenStore.delete(deviceId);
 
-  res.json({ ok: true });
+  res.json({ ok: true, removedCount });
 });
 
 // ---------- Start Server ----------
