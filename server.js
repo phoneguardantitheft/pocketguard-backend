@@ -2,12 +2,53 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
+import admin from "firebase-admin";
+import fs from "fs";
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ---------- Firebase Admin / Firestore ----------
+function loadFirebaseServiceAccount() {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } catch (error) {
+      console.error("Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON:", error);
+      process.exit(1);
+    }
+  }
+
+  const serviceAccountPath = "./serviceAccountKey.json";
+
+  if (!fs.existsSync(serviceAccountPath)) {
+    console.error(
+      "Missing Firebase credentials. Provide FIREBASE_SERVICE_ACCOUNT_JSON or serviceAccountKey.json."
+    );
+    process.exit(1);
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(serviceAccountPath, "utf8"));
+  } catch (error) {
+    console.error("Failed to read serviceAccountKey.json:", error);
+    process.exit(1);
+  }
+}
+
+const serviceAccount = loadFirebaseServiceAccount();
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
+
+const db = admin.firestore();
+const linkedBanksCollection = db.collection("plaid_linked_banks");
 
 // ---------- Plaid client ----------
 const PLAID_CLIENT_ID = process.env.PLAID_CLIENT_ID;
@@ -30,6 +71,11 @@ if (!PLAID_REDIRECT_URI) {
   process.exit(1);
 }
 
+if (!PlaidEnvironments[PLAID_ENV]) {
+  console.error(`Invalid PLAID_ENV value: ${PLAID_ENV}`);
+  process.exit(1);
+}
+
 const configuration = new Configuration({
   basePath: PlaidEnvironments[PLAID_ENV],
   baseOptions: {
@@ -42,22 +88,32 @@ const configuration = new Configuration({
 
 const plaidClient = new PlaidApi(configuration);
 
-// ---------- MVP storage ----------
-// deviceId => [ { access_token, item_id, institution_name } ]
-const tokenStore = new Map();
+// ---------- Firestore helpers ----------
+async function getLinkedItems(deviceId) {
+  const doc = await linkedBanksCollection.doc(deviceId).get();
+  if (!doc.exists) return [];
 
-// ---------- Helpers ----------
-function getLinkedItems(deviceId) {
-  const items = tokenStore.get(deviceId);
-  return Array.isArray(items) ? items : [];
+  const data = doc.data() || {};
+  return Array.isArray(data.items) ? data.items : [];
 }
 
-function setLinkedItems(deviceId, items) {
-  tokenStore.set(deviceId, items);
+async function setLinkedItems(deviceId, items) {
+  await linkedBanksCollection.doc(deviceId).set(
+    {
+      items,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+}
+
+async function clearLinkedItems(deviceId) {
+  await linkedBanksCollection.doc(deviceId).delete();
 }
 
 function dedupeAccounts(accounts) {
   const seen = new Set();
+
   return accounts.filter((acct) => {
     const key = acct.account_id;
     if (!key || seen.has(key)) return false;
@@ -68,6 +124,7 @@ function dedupeAccounts(accounts) {
 
 function dedupeTransactions(transactions) {
   const seen = new Set();
+
   return transactions.filter((txn) => {
     const key = txn.transaction_id;
     if (!key || seen.has(key)) return false;
@@ -77,7 +134,22 @@ function dedupeTransactions(transactions) {
 }
 
 // ---------- Health ----------
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", async (req, res) => {
+  try {
+    await db.listCollections();
+    res.json({
+      ok: true,
+      firestore: true,
+      env: PLAID_ENV,
+    });
+  } catch (error) {
+    console.error("health error:", error);
+    res.status(500).json({
+      ok: false,
+      firestore: false,
+    });
+  }
+});
 
 // ---------- OAuth Redirect ----------
 app.get("/plaid/oauth", (req, res) => {
@@ -102,12 +174,12 @@ const appleAssociation = {
         appIDs: [`${APPLE_TEAM_ID}.${IOS_BUNDLE_ID}`],
         components: [
           {
-            "/": "/plaid/oauth*"
-          }
-        ]
-      }
-    ]
-  }
+            "/": "/plaid/oauth*",
+          },
+        ],
+      },
+    ],
+  },
 };
 
 app.get("/.well-known/apple-app-site-association", (req, res) => {
@@ -186,25 +258,18 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
       );
     }
 
-    const existingItems = getLinkedItems(deviceId);
-
+    const existingItems = await getLinkedItems(deviceId);
     const alreadyLinked = existingItems.some((item) => item.item_id === item_id);
 
-    let updatedItems;
-    if (alreadyLinked) {
-      updatedItems = existingItems.map((item) =>
-        item.item_id === item_id
-          ? { ...item, access_token, institution_name }
-          : item
-      );
-    } else {
-      updatedItems = [
-        ...existingItems,
-        { access_token, item_id, institution_name },
-      ];
-    }
+    const updatedItems = alreadyLinked
+      ? existingItems.map((item) =>
+          item.item_id === item_id
+            ? { ...item, access_token, institution_name }
+            : item
+        )
+      : [...existingItems, { access_token, item_id, institution_name }];
 
-    setLinkedItems(deviceId, updatedItems);
+    await setLinkedItems(deviceId, updatedItems);
 
     res.json({
       ok: true,
@@ -227,10 +292,13 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       return res.status(400).json({ error: "Missing deviceId" });
     }
 
-    const linkedItems = getLinkedItems(deviceId);
+    const linkedItems = await getLinkedItems(deviceId);
 
     if (linkedItems.length === 0) {
-      return res.status(400).json({ error: "No linked banks for this deviceId" });
+      return res.status(400).json({
+        error: "No linked banks for this deviceId",
+        code: "NO_LINKED_BANKS",
+      });
     }
 
     const now = new Date();
@@ -305,43 +373,67 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       "get_accounts_and_transactions error:",
       err?.response?.data || err
     );
-
     res.status(500).json({ error: "Failed to fetch data" });
   }
 });
 
 // ---------- 4) Debug: list linked banks for device ----------
-app.post("/plaid/list_linked_banks", (req, res) => {
-  const { deviceId } = req.body;
+app.post("/plaid/list_linked_banks", async (req, res) => {
+  try {
+    const { deviceId } = req.body;
 
-  if (!deviceId) {
-    return res.status(400).json({ error: "Missing deviceId" });
+    if (!deviceId) {
+      return res.status(400).json({ error: "Missing deviceId" });
+    }
+
+    const linkedItems = await getLinkedItems(deviceId);
+
+    res.json({
+      ok: true,
+      linkedBanks: linkedItems.map((item) => ({
+        item_id: item.item_id,
+        institution_name: item.institution_name,
+      })),
+      count: linkedItems.length,
+    });
+  } catch (error) {
+    console.error("list_linked_banks error:", error);
+    res.status(500).json({ error: "Failed to list linked banks" });
   }
-
-  const linkedItems = getLinkedItems(deviceId);
-
-  res.json({
-    ok: true,
-    linkedBanks: linkedItems.map((item) => ({
-      item_id: item.item_id,
-      institution_name: item.institution_name,
-    })),
-    count: linkedItems.length,
-  });
 });
 
 // ---------- 5) Unlink ALL banks ----------
-app.post("/plaid/unlink", (req, res) => {
-  const { deviceId } = req.body;
+app.post("/plaid/unlink", async (req, res) => {
+  try {
+    const { deviceId } = req.body;
 
-  if (!deviceId) {
-    return res.status(400).json({ error: "Missing deviceId" });
+    if (!deviceId) {
+      return res.status(400).json({ error: "Missing deviceId" });
+    }
+
+    const linkedItems = await getLinkedItems(deviceId);
+    const removedCount = linkedItems.length;
+
+    for (const item of linkedItems) {
+      try {
+        await plaidClient.itemRemove({
+          access_token: item.access_token,
+        });
+      } catch (removeErr) {
+        console.warn(
+          `Plaid itemRemove failed for ${item.item_id}:`,
+          removeErr?.response?.data || removeErr
+        );
+      }
+    }
+
+    await clearLinkedItems(deviceId);
+
+    res.json({ ok: true, removedCount });
+  } catch (error) {
+    console.error("unlink error:", error);
+    res.status(500).json({ error: "Failed to unlink banks" });
   }
-
-  const removedCount = getLinkedItems(deviceId).length;
-  tokenStore.delete(deviceId);
-
-  res.json({ ok: true, removedCount });
 });
 
 // ---------- Start Server ----------
