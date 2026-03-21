@@ -133,6 +133,56 @@ function dedupeTransactions(transactions) {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getPlaidErrorData(err) {
+  return err?.response?.data || err;
+}
+
+function isProductNotReadyError(err) {
+  const data = getPlaidErrorData(err);
+  return data?.error_code === "PRODUCT_NOT_READY";
+}
+
+async function fetchTransactionsWithRetry({
+  access_token,
+  start_date,
+  end_date,
+  maxAttempts = 5,
+  delayMs = 2500,
+}) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await plaidClient.transactionsGet({
+        access_token,
+        start_date,
+        end_date,
+        options: {
+          count: 500,
+          offset: 0,
+        },
+      });
+    } catch (err) {
+      lastError = err;
+
+      if (!isProductNotReadyError(err) || attempt === maxAttempts) {
+        throw err;
+      }
+
+      console.warn(
+        `transactionsGet PRODUCT_NOT_READY (attempt ${attempt}/${maxAttempts}). Retrying in ${delayMs}ms...`
+      );
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
 // ---------- Health ----------
 app.get("/health", async (req, res) => {
   try {
@@ -212,7 +262,7 @@ app.post("/plaid/create_link_token", async (req, res) => {
 
     res.json({ link_token: response.data.link_token });
   } catch (err) {
-    console.error("create_link_token error:", err?.response?.data || err);
+    console.error("create_link_token error:", getPlaidErrorData(err));
     res.status(500).json({ error: "Failed to create link token" });
   }
 });
@@ -254,7 +304,7 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
     } catch (institutionErr) {
       console.warn(
         "Could not resolve institution name:",
-        institutionErr?.response?.data || institutionErr
+        getPlaidErrorData(institutionErr)
       );
     }
 
@@ -278,7 +328,7 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
       linked_item_count: updatedItems.length,
     });
   } catch (err) {
-    console.error("exchange_public_token error:", err?.response?.data || err);
+    console.error("exchange_public_token error:", getPlaidErrorData(err));
     res.status(500).json({ error: "Failed to exchange public token" });
   }
 });
@@ -310,6 +360,7 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
     const allAccounts = [];
     const allTransactions = [];
     const linkedInstitutions = [];
+    const itemErrors = [];
 
     for (const linkedItem of linkedItems) {
       const { access_token, item_id, institution_name } = linkedItem;
@@ -319,14 +370,12 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           access_token,
         });
 
-        const txResp = await plaidClient.transactionsGet({
+        const txResp = await fetchTransactionsWithRetry({
           access_token,
           start_date: start,
           end_date: end,
-          options: {
-            count: 500,
-            offset: 0,
-          },
+          maxAttempts: 5,
+          delayMs: 2500,
         });
 
         const accountsWithInstitution = accountsResp.data.accounts.map((acct) => ({
@@ -350,10 +399,16 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           account_count: accountsResp.data.accounts.length,
         });
       } catch (itemErr) {
-        console.error(
-          `Error fetching data for item ${item_id}:`,
-          itemErr?.response?.data || itemErr
-        );
+        const errData = getPlaidErrorData(itemErr);
+
+        console.error(`Error fetching data for item ${item_id}:`, errData);
+
+        itemErrors.push({
+          item_id,
+          institution_name,
+          error_code: errData?.error_code || "UNKNOWN_ERROR",
+          error_message: errData?.error_message || "Unable to fetch item data",
+        });
       }
     }
 
@@ -362,16 +417,33 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       return new Date(b.date) - new Date(a.date);
     });
 
+    if (uniqueAccounts.length === 0 && itemErrors.length > 0) {
+      const hasProductNotReady = itemErrors.some(
+        (e) => e.error_code === "PRODUCT_NOT_READY"
+      );
+
+      return res.status(hasProductNotReady ? 202 : 500).json({
+        error: hasProductNotReady
+          ? "Transactions are still being prepared. Please refresh again shortly."
+          : "Failed to fetch data",
+        code: hasProductNotReady ? "PRODUCT_NOT_READY" : "FETCH_FAILED",
+        linkedInstitutions,
+        itemErrors,
+        dateRange: { start, end },
+      });
+    }
+
     res.json({
       accounts: uniqueAccounts,
       transactions: uniqueTransactions,
       linkedInstitutions,
+      itemErrors,
       dateRange: { start, end },
     });
   } catch (err) {
     console.error(
       "get_accounts_and_transactions error:",
-      err?.response?.data || err
+      getPlaidErrorData(err)
     );
     res.status(500).json({ error: "Failed to fetch data" });
   }
@@ -422,7 +494,7 @@ app.post("/plaid/unlink", async (req, res) => {
       } catch (removeErr) {
         console.warn(
           `Plaid itemRemove failed for ${item.item_id}:`,
-          removeErr?.response?.data || removeErr
+          getPlaidErrorData(removeErr)
         );
       }
     }
