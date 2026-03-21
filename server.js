@@ -146,6 +146,12 @@ function isProductNotReadyError(err) {
   return data?.error_code === "PRODUCT_NOT_READY";
 }
 
+function normalizeInstitutionName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase();
+}
+
 async function fetchTransactionsWithRetry({
   access_token,
   start_date,
@@ -309,15 +315,44 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
     }
 
     const existingItems = await getLinkedItems(deviceId);
-    const alreadyLinked = existingItems.some((item) => item.item_id === item_id);
+    const normalizedInstitution = normalizeInstitutionName(institution_name);
 
-    const updatedItems = alreadyLinked
-      ? existingItems.map((item) =>
-          item.item_id === item_id
-            ? { ...item, access_token, institution_name }
-            : item
-        )
-      : [...existingItems, { access_token, item_id, institution_name }];
+    const exactItemExists = existingItems.some((item) => item.item_id === item_id);
+
+    let updatedItems = existingItems;
+
+    if (exactItemExists) {
+      updatedItems = existingItems.map((item) =>
+        item.item_id === item_id
+          ? { ...item, access_token, institution_name }
+          : item
+      );
+    } else {
+      const duplicateInstitutionItems = existingItems.filter(
+        (item) =>
+          normalizeInstitutionName(item.institution_name) === normalizedInstitution
+      );
+
+      for (const oldItem of duplicateInstitutionItems) {
+        try {
+          await plaidClient.itemRemove({
+            access_token: oldItem.access_token,
+          });
+        } catch (removeErr) {
+          console.warn(
+            `Plaid itemRemove failed while replacing duplicate institution ${oldItem.item_id}:`,
+            getPlaidErrorData(removeErr)
+          );
+        }
+      }
+
+      updatedItems = existingItems.filter(
+        (item) =>
+          normalizeInstitutionName(item.institution_name) !== normalizedInstitution
+      );
+
+      updatedItems.push({ access_token, item_id, institution_name });
+    }
 
     await setLinkedItems(deviceId, updatedItems);
 
