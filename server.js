@@ -170,7 +170,6 @@ async function fetchTransactionsWithRetry({
         options: {
           count: 500,
           offset: 0,
-          include_personal_finance_category: true,
         },
       });
     } catch (err) {
@@ -188,33 +187,6 @@ async function fetchTransactionsWithRetry({
   }
 
   throw lastError;
-}
-
-async function fetchFreshAccountsWithFallback(access_token) {
-  try {
-    const balanceResp = await plaidClient.accountsBalanceGet({
-      access_token,
-    });
-
-    return {
-      accounts: balanceResp.data.accounts || [],
-      source: "accountsBalanceGet",
-    };
-  } catch (balanceErr) {
-    console.warn(
-      "accountsBalanceGet failed, falling back to accountsGet:",
-      getPlaidErrorData(balanceErr)
-    );
-
-    const accountsResp = await plaidClient.accountsGet({
-      access_token,
-    });
-
-    return {
-      accounts: accountsResp.data.accounts || [],
-      source: "accountsGet",
-    };
-  }
 }
 
 // ---------- Health ----------
@@ -429,7 +401,9 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       const { access_token, item_id, institution_name } = linkedItem;
 
       try {
-        const freshAccountsResult = await fetchFreshAccountsWithFallback(access_token);
+        const accountsResp = await plaidClient.accountsGet({
+          access_token,
+        });
 
         const txResp = await fetchTransactionsWithRetry({
           access_token,
@@ -439,11 +413,10 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           delayMs: 2500,
         });
 
-        const accountsWithInstitution = freshAccountsResult.accounts.map((acct) => ({
+        const accountsWithInstitution = accountsResp.data.accounts.map((acct) => ({
           ...acct,
           institution_name,
           linked_item_id: item_id,
-          balance_source: freshAccountsResult.source,
         }));
 
         const transactionsWithInstitution = txResp.data.transactions.map((txn) => ({
@@ -458,8 +431,7 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
         linkedInstitutions.push({
           item_id,
           institution_name,
-          account_count: freshAccountsResult.accounts.length,
-          balance_source: freshAccountsResult.source,
+          account_count: accountsResp.data.accounts.length,
         });
       } catch (itemErr) {
         const errData = getPlaidErrorData(itemErr);
