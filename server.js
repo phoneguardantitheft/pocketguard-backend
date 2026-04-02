@@ -49,6 +49,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const linkedBanksCollection = db.collection("plaid_linked_banks");
+const plaidItemStateCollection = db.collection("plaid_item_state");
 
 // ---------- Plaid client ----------
 const PLAID_CLIENT_ID = process.env.PLAID_CLIENT_ID;
@@ -88,27 +89,15 @@ const configuration = new Configuration({
 
 const plaidClient = new PlaidApi(configuration);
 
-// ---------- Firestore helpers ----------
-async function getLinkedItems(deviceId) {
-  const doc = await linkedBanksCollection.doc(deviceId).get();
-  if (!doc.exists) return [];
-
-  const data = doc.data() || {};
-  return Array.isArray(data.items) ? data.items : [];
+// ---------- Helpers ----------
+function getPlaidErrorData(err) {
+  return err?.response?.data || err;
 }
 
-async function setLinkedItems(deviceId, items) {
-  await linkedBanksCollection.doc(deviceId).set(
-    {
-      items,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
-}
-
-async function clearLinkedItems(deviceId) {
-  await linkedBanksCollection.doc(deviceId).delete();
+function normalizeInstitutionName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase();
 }
 
 function dedupeAccounts(accounts) {
@@ -133,31 +122,68 @@ function dedupeTransactions(transactions) {
   });
 }
 
-function getPlaidErrorData(err) {
-  return err?.response?.data || err;
+function itemStateDocId(deviceId, itemId) {
+  return `${deviceId}__${itemId}`;
 }
 
-function normalizeInstitutionName(name) {
-  return String(name || "")
-    .trim()
-    .toLowerCase();
+function sortTransactionsNewestFirst(transactions) {
+  return [...transactions].sort((a, b) => {
+    const aDate = new Date(a.date || 0).getTime();
+    const bDate = new Date(b.date || 0).getTime();
+    return bDate - aDate;
+  });
 }
 
-async function fetchTransactionsSyncAll(access_token) {
-  let cursor = null;
+function mergeTransactions(existingTransactions, added, modified, removed) {
+  const byId = new Map();
+
+  for (const txn of existingTransactions || []) {
+    if (txn?.transaction_id) {
+      byId.set(txn.transaction_id, txn);
+    }
+  }
+
+  for (const txn of added || []) {
+    if (txn?.transaction_id) {
+      byId.set(txn.transaction_id, txn);
+    }
+  }
+
+  for (const txn of modified || []) {
+    if (txn?.transaction_id) {
+      byId.set(txn.transaction_id, txn);
+    }
+  }
+
+  for (const removedTxn of removed || []) {
+    if (removedTxn?.transaction_id) {
+      byId.delete(removedTxn.transaction_id);
+    }
+  }
+
+  return sortTransactionsNewestFirst(Array.from(byId.values()));
+}
+
+async function fetchTransactionsSyncPage(access_token, cursor) {
+  const response = await plaidClient.transactionsSync({
+    access_token,
+    cursor: cursor || undefined,
+    count: 500,
+  });
+
+  return response.data;
+}
+
+async function fetchTransactionsSyncAll(access_token, startingCursor = null) {
+  let cursor = startingCursor || null;
   let added = [];
   let modified = [];
   let removed = [];
   let hasMore = true;
+  let finalCursor = cursor;
 
   while (hasMore) {
-    const resp = await plaidClient.transactionsSync({
-      access_token,
-      cursor,
-      count: 500,
-    });
-
-    const data = resp.data;
+    const data = await fetchTransactionsSyncPage(access_token, cursor);
 
     added.push(...(data.added || []));
     modified.push(...(data.modified || []));
@@ -165,38 +191,103 @@ async function fetchTransactionsSyncAll(access_token) {
 
     hasMore = data.has_more;
     cursor = data.next_cursor;
+    finalCursor = data.next_cursor;
   }
 
   return {
     added,
     modified,
     removed,
-    cursor,
+    next_cursor: finalCursor,
   };
 }
 
-function buildTransactionsFromSync(syncData) {
-  const removedIds = new Set((syncData.removed || []).map((r) => r.transaction_id));
+async function fetchTransactionsSyncAllWithRetry(access_token, startingCursor = null, maxAttempts = 3) {
+  let attempt = 0;
 
-  const byId = new Map();
+  while (attempt < maxAttempts) {
+    try {
+      return await fetchTransactionsSyncAll(access_token, startingCursor);
+    } catch (err) {
+      const data = getPlaidErrorData(err);
+      const errorCode = data?.error_code || "";
 
-  for (const txn of syncData.added || []) {
-    if (txn?.transaction_id) {
-      byId.set(txn.transaction_id, txn);
+      if (errorCode !== "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION") {
+        throw err;
+      }
+
+      attempt += 1;
+
+      if (attempt >= maxAttempts) {
+        throw err;
+      }
+
+      console.warn(
+        `transactionsSync mutation during pagination, retrying (${attempt}/${maxAttempts})`
+      );
     }
   }
 
-  for (const txn of syncData.modified || []) {
-    if (txn?.transaction_id) {
-      byId.set(txn.transaction_id, txn);
-    }
+  throw new Error("transactionsSync retry exhausted");
+}
+
+// ---------- Firestore helpers ----------
+async function getLinkedItems(deviceId) {
+  const doc = await linkedBanksCollection.doc(deviceId).get();
+  if (!doc.exists) return [];
+
+  const data = doc.data() || {};
+  return Array.isArray(data.items) ? data.items : [];
+}
+
+async function setLinkedItems(deviceId, items) {
+  await linkedBanksCollection.doc(deviceId).set(
+    {
+      items,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+}
+
+async function clearLinkedItems(deviceId) {
+  await linkedBanksCollection.doc(deviceId).delete();
+}
+
+async function getItemState(deviceId, itemId) {
+  const docId = itemStateDocId(deviceId, itemId);
+  const doc = await plaidItemStateCollection.doc(docId).get();
+
+  if (!doc.exists) {
+    return {
+      cursor: null,
+      transactions: [],
+    };
   }
 
-  for (const removedId of removedIds) {
-    byId.delete(removedId);
-  }
+  const data = doc.data() || {};
+  return {
+    cursor: data.cursor || null,
+    transactions: Array.isArray(data.transactions) ? data.transactions : [],
+  };
+}
 
-  return Array.from(byId.values());
+async function setItemState(deviceId, itemId, state) {
+  const docId = itemStateDocId(deviceId, itemId);
+
+  await plaidItemStateCollection.doc(docId).set(
+    {
+      cursor: state.cursor || null,
+      transactions: state.transactions || [],
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+}
+
+async function clearItemState(deviceId, itemId) {
+  const docId = itemStateDocId(deviceId, itemId);
+  await plaidItemStateCollection.doc(docId).delete();
 }
 
 // ---------- Health ----------
@@ -274,6 +365,10 @@ app.post("/plaid/create_link_token", async (req, res) => {
       country_codes: ["US"],
       language: "en",
       redirect_uri: PLAID_REDIRECT_URI,
+      webhook: process.env.PLAID_TRANSACTIONS_WEBHOOK_URL || undefined,
+      transactions: {
+        days_requested: 90,
+      },
     });
 
     res.json({ link_token: response.data.link_token });
@@ -354,6 +449,15 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
             getPlaidErrorData(removeErr)
           );
         }
+
+        try {
+          await clearItemState(deviceId, oldItem.item_id);
+        } catch (stateErr) {
+          console.warn(
+            `Failed clearing old item state for ${oldItem.item_id}:`,
+            stateErr
+          );
+        }
       }
 
       updatedItems = existingItems.filter(
@@ -365,6 +469,12 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
     }
 
     await setLinkedItems(deviceId, updatedItems);
+
+    // initialize empty sync state for new/relinked item
+    await setItemState(deviceId, item_id, {
+      cursor: null,
+      transactions: [],
+    });
 
     res.json({
       ok: true,
@@ -387,6 +497,8 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       return res.status(400).json({ error: "Missing deviceId" });
     }
 
+    console.log(`[refresh] start deviceId=${deviceId}`);
+
     const linkedItems = await getLinkedItems(deviceId);
 
     if (linkedItems.length === 0) {
@@ -401,16 +513,39 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
     const linkedInstitutions = [];
     const itemErrors = [];
 
+    let totalAdded = 0;
+    let totalModified = 0;
+    let totalRemoved = 0;
+
     for (const linkedItem of linkedItems) {
       const { access_token, item_id, institution_name } = linkedItem;
 
       try {
+        const savedState = await getItemState(deviceId, item_id);
+        const savedCursor = savedState.cursor || null;
+        const savedTransactions = savedState.transactions || [];
+
         const accountsResp = await plaidClient.accountsGet({
           access_token,
         });
 
-        const syncResp = await fetchTransactionsSyncAll(access_token);
-        const latestTransactions = buildTransactionsFromSync(syncResp);
+        const syncResp = await fetchTransactionsSyncAllWithRetry(access_token, savedCursor);
+
+        const mergedTransactions = mergeTransactions(
+          savedTransactions,
+          syncResp.added || [],
+          syncResp.modified || [],
+          syncResp.removed || []
+        );
+
+        await setItemState(deviceId, item_id, {
+          cursor: syncResp.next_cursor || savedCursor,
+          transactions: mergedTransactions,
+        });
+
+        totalAdded += (syncResp.added || []).length;
+        totalModified += (syncResp.modified || []).length;
+        totalRemoved += (syncResp.removed || []).length;
 
         const accountsWithInstitution = accountsResp.data.accounts.map((acct) => ({
           ...acct,
@@ -418,7 +553,7 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           linked_item_id: item_id,
         }));
 
-        const transactionsWithInstitution = latestTransactions.map((txn) => ({
+        const transactionsWithInstitution = mergedTransactions.map((txn) => ({
           ...txn,
           institution_name,
           linked_item_id: item_id,
@@ -431,11 +566,17 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           item_id,
           institution_name,
           account_count: accountsResp.data.accounts.length,
-          sync_cursor: syncResp.cursor,
-          added_count: syncResp.added.length,
-          modified_count: syncResp.modified.length,
-          removed_count: syncResp.removed.length,
+          previous_cursor: savedCursor,
+          next_cursor: syncResp.next_cursor || savedCursor,
+          added_count: (syncResp.added || []).length,
+          modified_count: (syncResp.modified || []).length,
+          removed_count: (syncResp.removed || []).length,
+          total_cached_transactions: mergedTransactions.length,
         });
+
+        console.log(
+          `[refresh] item=${institution_name} added=${(syncResp.added || []).length} modified=${(syncResp.modified || []).length} removed=${(syncResp.removed || []).length} cached=${mergedTransactions.length}`
+        );
       } catch (itemErr) {
         const errData = getPlaidErrorData(itemErr);
 
@@ -451,11 +592,9 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
     }
 
     const uniqueAccounts = dedupeAccounts(allAccounts);
-    const uniqueTransactions = dedupeTransactions(allTransactions).sort((a, b) => {
-      const aDate = new Date(a.date || 0).getTime();
-      const bDate = new Date(b.date || 0).getTime();
-      return bDate - aDate;
-    });
+    const uniqueTransactions = sortTransactionsNewestFirst(
+      dedupeTransactions(allTransactions)
+    );
 
     if (uniqueAccounts.length === 0 && itemErrors.length > 0) {
       return res.status(500).json({
@@ -465,6 +604,10 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
         itemErrors,
       });
     }
+
+    console.log(
+      `[refresh] done deviceId=${deviceId} accounts=${uniqueAccounts.length} transactions=${uniqueTransactions.length} added=${totalAdded} modified=${totalModified} removed=${totalRemoved}`
+    );
 
     res.json({
       accounts: uniqueAccounts,
@@ -477,6 +620,11 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
         partial: itemErrors.length > 0,
         errorCodes: itemErrors.map((e) => e.error_code),
         messages: itemErrors.map((e) => `${e.institution_name}: ${e.error_message}`),
+        stats: {
+          added: totalAdded,
+          modified: totalModified,
+          removed: totalRemoved,
+        },
       },
     });
   } catch (err) {
@@ -499,12 +647,21 @@ app.post("/plaid/list_linked_banks", async (req, res) => {
 
     const linkedItems = await getLinkedItems(deviceId);
 
+    const enriched = await Promise.all(
+      linkedItems.map(async (item) => {
+        const state = await getItemState(deviceId, item.item_id);
+        return {
+          item_id: item.item_id,
+          institution_name: item.institution_name,
+          has_cursor: !!state.cursor,
+          cached_transaction_count: (state.transactions || []).length,
+        };
+      })
+    );
+
     res.json({
       ok: true,
-      linkedBanks: linkedItems.map((item) => ({
-        item_id: item.item_id,
-        institution_name: item.institution_name,
-      })),
+      linkedBanks: enriched,
       count: linkedItems.length,
     });
   } catch (error) {
@@ -534,6 +691,15 @@ app.post("/plaid/unlink", async (req, res) => {
         console.warn(
           `Plaid itemRemove failed for ${item.item_id}:`,
           getPlaidErrorData(removeErr)
+        );
+      }
+
+      try {
+        await clearItemState(deviceId, item.item_id);
+      } catch (stateErr) {
+        console.warn(
+          `Failed clearing item state for ${item.item_id}:`,
+          stateErr
         );
       }
     }
