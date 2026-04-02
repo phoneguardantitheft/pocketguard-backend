@@ -153,10 +153,7 @@ function normalizeInstitutionName(name) {
 }
 
 function getTransactionsLastSuccessfulUpdate(itemData) {
-  return (
-    itemData?.item?.status?.transactions?.last_successful_update ||
-    null
-  );
+  return itemData?.item?.status?.transactions?.last_successful_update || null;
 }
 
 async function fetchTransactionsWithRetry({
@@ -201,11 +198,23 @@ async function triggerTransactionsRefresh(access_token) {
     await plaidClient.transactionsRefresh({
       access_token,
     });
-    return true;
+
+    return {
+      requested: true,
+      succeeded: true,
+      error_code: null,
+      error_message: null,
+    };
   } catch (err) {
     const data = getPlaidErrorData(err);
     console.warn("transactionsRefresh failed:", data);
-    return false;
+
+    return {
+      requested: true,
+      succeeded: false,
+      error_code: data?.error_code || "UNKNOWN_ERROR",
+      error_message: data?.error_message || "transactions_refresh failed",
+    };
   }
 }
 
@@ -472,6 +481,11 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
     const linkedInstitutions = [];
     const itemErrors = [];
 
+    let overallRefreshRequested = false;
+    let overallRefreshSucceeded = true;
+    const overallRefreshErrorCodes = new Set();
+    const overallRefreshMessages = [];
+
     for (const linkedItem of linkedItems) {
       const { access_token, item_id, institution_name } = linkedItem;
 
@@ -488,14 +502,25 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           );
         }
 
-        const refreshTriggered = await triggerTransactionsRefresh(access_token);
+        const refreshStatus = await triggerTransactionsRefresh(access_token);
+        overallRefreshRequested = overallRefreshRequested || refreshStatus.requested;
+
+        if (!refreshStatus.succeeded) {
+          overallRefreshSucceeded = false;
+          if (refreshStatus.error_code) {
+            overallRefreshErrorCodes.add(refreshStatus.error_code);
+          }
+          if (refreshStatus.error_message) {
+            overallRefreshMessages.push(`${institution_name}: ${refreshStatus.error_message}`);
+          }
+        }
 
         let refreshResult = {
           updated: false,
           timestamp: previousTransactionsUpdate,
         };
 
-        if (refreshTriggered) {
+        if (refreshStatus.succeeded) {
           refreshResult = await waitForTransactionsUpdateAdvance(
             access_token,
             previousTransactionsUpdate
@@ -533,7 +558,10 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           item_id,
           institution_name,
           account_count: accountsResp.data.accounts.length,
-          refresh_triggered: refreshTriggered,
+          refresh_requested: refreshStatus.requested,
+          refresh_succeeded: refreshStatus.succeeded,
+          refresh_error_code: refreshStatus.error_code,
+          refresh_error_message: refreshStatus.error_message,
           transactions_update_advanced: refreshResult.updated,
           last_transactions_update: refreshResult.timestamp,
         });
@@ -568,15 +596,32 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
         code: hasProductNotReady ? "PRODUCT_NOT_READY" : "FETCH_FAILED",
         linkedInstitutions,
         itemErrors,
+        refreshStatus: {
+          requested: overallRefreshRequested,
+          succeeded: false,
+          partial: false,
+          errorCodes: Array.from(overallRefreshErrorCodes),
+          messages: overallRefreshMessages,
+        },
         dateRange: { start, end },
       });
     }
+
+    const hasItemErrors = itemErrors.length > 0;
+    const refreshPartial = hasItemErrors || !overallRefreshSucceeded;
 
     res.json({
       accounts: uniqueAccounts,
       transactions: uniqueTransactions,
       linkedInstitutions,
       itemErrors,
+      refreshStatus: {
+        requested: overallRefreshRequested,
+        succeeded: overallRefreshSucceeded && !hasItemErrors,
+        partial: refreshPartial,
+        errorCodes: Array.from(overallRefreshErrorCodes),
+        messages: overallRefreshMessages,
+      },
       dateRange: { start, end },
     });
   } catch (err) {
