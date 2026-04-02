@@ -152,6 +152,13 @@ function normalizeInstitutionName(name) {
     .toLowerCase();
 }
 
+function getTransactionsLastSuccessfulUpdate(itemData) {
+  return (
+    itemData?.item?.status?.transactions?.last_successful_update ||
+    null
+  );
+}
+
 async function fetchTransactionsWithRetry({
   access_token,
   start_date,
@@ -187,6 +194,74 @@ async function fetchTransactionsWithRetry({
   }
 
   throw lastError;
+}
+
+async function triggerTransactionsRefresh(access_token) {
+  try {
+    await plaidClient.transactionsRefresh({
+      access_token,
+    });
+    return true;
+  } catch (err) {
+    const data = getPlaidErrorData(err);
+    console.warn("transactionsRefresh failed:", data);
+    return false;
+  }
+}
+
+async function getItemWithRetry(access_token, maxAttempts = 3, delayMs = 1000) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await plaidClient.itemGet({ access_token });
+    } catch (err) {
+      lastError = err;
+      if (attempt === maxAttempts) throw err;
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+async function waitForTransactionsUpdateAdvance(access_token, previousTimestamp) {
+  const maxPolls = 6;
+  const delayMs = 2000;
+
+  for (let poll = 1; poll <= maxPolls; poll += 1) {
+    await sleep(delayMs);
+
+    try {
+      const itemResp = await getItemWithRetry(access_token, 2, 750);
+      const currentTimestamp = getTransactionsLastSuccessfulUpdate(itemResp.data);
+
+      if (!previousTimestamp && currentTimestamp) {
+        return {
+          updated: true,
+          timestamp: currentTimestamp,
+        };
+      }
+
+      if (
+        previousTimestamp &&
+        currentTimestamp &&
+        new Date(currentTimestamp).getTime() > new Date(previousTimestamp).getTime()
+      ) {
+        return {
+          updated: true,
+          timestamp: currentTimestamp,
+        };
+      }
+    } catch (err) {
+      console.warn("waitForTransactionsUpdateAdvance itemGet failed:", getPlaidErrorData(err));
+    }
+  }
+
+  return {
+    updated: false,
+    timestamp: previousTimestamp || null,
+  };
 }
 
 // ---------- Health ----------
@@ -401,6 +476,32 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       const { access_token, item_id, institution_name } = linkedItem;
 
       try {
+        let previousTransactionsUpdate = null;
+
+        try {
+          const itemBefore = await getItemWithRetry(access_token, 2, 750);
+          previousTransactionsUpdate = getTransactionsLastSuccessfulUpdate(itemBefore.data);
+        } catch (itemBeforeErr) {
+          console.warn(
+            `itemGet before refresh failed for ${item_id}:`,
+            getPlaidErrorData(itemBeforeErr)
+          );
+        }
+
+        const refreshTriggered = await triggerTransactionsRefresh(access_token);
+
+        let refreshResult = {
+          updated: false,
+          timestamp: previousTransactionsUpdate,
+        };
+
+        if (refreshTriggered) {
+          refreshResult = await waitForTransactionsUpdateAdvance(
+            access_token,
+            previousTransactionsUpdate
+          );
+        }
+
         const accountsResp = await plaidClient.accountsGet({
           access_token,
         });
@@ -432,6 +533,9 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           item_id,
           institution_name,
           account_count: accountsResp.data.accounts.length,
+          refresh_triggered: refreshTriggered,
+          transactions_update_advanced: refreshResult.updated,
+          last_transactions_update: refreshResult.timestamp,
         });
       } catch (itemErr) {
         const errData = getPlaidErrorData(itemErr);
