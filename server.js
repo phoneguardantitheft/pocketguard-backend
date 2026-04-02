@@ -133,17 +133,8 @@ function dedupeTransactions(transactions) {
   });
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function getPlaidErrorData(err) {
   return err?.response?.data || err;
-}
-
-function isProductNotReadyError(err) {
-  const data = getPlaidErrorData(err);
-  return data?.error_code === "PRODUCT_NOT_READY";
 }
 
 function normalizeInstitutionName(name) {
@@ -152,125 +143,60 @@ function normalizeInstitutionName(name) {
     .toLowerCase();
 }
 
-function getTransactionsLastSuccessfulUpdate(itemData) {
-  return itemData?.item?.status?.transactions?.last_successful_update || null;
-}
+async function fetchTransactionsSyncAll(access_token) {
+  let cursor = null;
+  let added = [];
+  let modified = [];
+  let removed = [];
+  let hasMore = true;
 
-async function fetchTransactionsWithRetry({
-  access_token,
-  start_date,
-  end_date,
-  maxAttempts = 5,
-  delayMs = 2500,
-}) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await plaidClient.transactionsGet({
-        access_token,
-        start_date,
-        end_date,
-        options: {
-          count: 500,
-          offset: 0,
-        },
-      });
-    } catch (err) {
-      lastError = err;
-
-      if (!isProductNotReadyError(err) || attempt === maxAttempts) {
-        throw err;
-      }
-
-      console.warn(
-        `transactionsGet PRODUCT_NOT_READY (attempt ${attempt}/${maxAttempts}). Retrying in ${delayMs}ms...`
-      );
-      await sleep(delayMs);
-    }
-  }
-
-  throw lastError;
-}
-
-async function triggerTransactionsRefresh(access_token) {
-  try {
-    await plaidClient.transactionsRefresh({
+  while (hasMore) {
+    const resp = await plaidClient.transactionsSync({
       access_token,
+      cursor,
+      count: 500,
     });
 
-    return {
-      requested: true,
-      succeeded: true,
-      error_code: null,
-      error_message: null,
-    };
-  } catch (err) {
-    const data = getPlaidErrorData(err);
-    console.warn("transactionsRefresh failed:", data);
+    const data = resp.data;
 
-    return {
-      requested: true,
-      succeeded: false,
-      error_code: data?.error_code || "UNKNOWN_ERROR",
-      error_message: data?.error_message || "transactions_refresh failed",
-    };
-  }
-}
+    added.push(...(data.added || []));
+    modified.push(...(data.modified || []));
+    removed.push(...(data.removed || []));
 
-async function getItemWithRetry(access_token, maxAttempts = 3, delayMs = 1000) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await plaidClient.itemGet({ access_token });
-    } catch (err) {
-      lastError = err;
-      if (attempt === maxAttempts) throw err;
-      await sleep(delayMs);
-    }
-  }
-
-  throw lastError;
-}
-
-async function waitForTransactionsUpdateAdvance(access_token, previousTimestamp) {
-  const maxPolls = 6;
-  const delayMs = 2000;
-
-  for (let poll = 1; poll <= maxPolls; poll += 1) {
-    await sleep(delayMs);
-
-    try {
-      const itemResp = await getItemWithRetry(access_token, 2, 750);
-      const currentTimestamp = getTransactionsLastSuccessfulUpdate(itemResp.data);
-
-      if (!previousTimestamp && currentTimestamp) {
-        return {
-          updated: true,
-          timestamp: currentTimestamp,
-        };
-      }
-
-      if (
-        previousTimestamp &&
-        currentTimestamp &&
-        new Date(currentTimestamp).getTime() > new Date(previousTimestamp).getTime()
-      ) {
-        return {
-          updated: true,
-          timestamp: currentTimestamp,
-        };
-      }
-    } catch (err) {
-      console.warn("waitForTransactionsUpdateAdvance itemGet failed:", getPlaidErrorData(err));
-    }
+    hasMore = data.has_more;
+    cursor = data.next_cursor;
   }
 
   return {
-    updated: false,
-    timestamp: previousTimestamp || null,
+    added,
+    modified,
+    removed,
+    cursor,
   };
+}
+
+function buildTransactionsFromSync(syncData) {
+  const removedIds = new Set((syncData.removed || []).map((r) => r.transaction_id));
+
+  const byId = new Map();
+
+  for (const txn of syncData.added || []) {
+    if (txn?.transaction_id) {
+      byId.set(txn.transaction_id, txn);
+    }
+  }
+
+  for (const txn of syncData.modified || []) {
+    if (txn?.transaction_id) {
+      byId.set(txn.transaction_id, txn);
+    }
+  }
+
+  for (const removedId of removedIds) {
+    byId.delete(removedId);
+  }
+
+  return Array.from(byId.values());
 }
 
 // ---------- Health ----------
@@ -455,7 +381,7 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
 // ---------- 3) Fetch Accounts + Transactions from ALL linked banks ----------
 app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
   try {
-    const { deviceId, startDate, endDate } = req.body;
+    const { deviceId } = req.body;
 
     if (!deviceId) {
       return res.status(400).json({ error: "Missing deviceId" });
@@ -470,74 +396,21 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       });
     }
 
-    const now = new Date();
-    const end = endDate || now.toISOString().slice(0, 10);
-    const start =
-      startDate ||
-      new Date(now.getTime() - 90 * 86400 * 1000).toISOString().slice(0, 10);
-
     const allAccounts = [];
     const allTransactions = [];
     const linkedInstitutions = [];
     const itemErrors = [];
 
-    let overallRefreshRequested = false;
-    let overallRefreshSucceeded = true;
-    const overallRefreshErrorCodes = new Set();
-    const overallRefreshMessages = [];
-
     for (const linkedItem of linkedItems) {
       const { access_token, item_id, institution_name } = linkedItem;
 
       try {
-        let previousTransactionsUpdate = null;
-
-        try {
-          const itemBefore = await getItemWithRetry(access_token, 2, 750);
-          previousTransactionsUpdate = getTransactionsLastSuccessfulUpdate(itemBefore.data);
-        } catch (itemBeforeErr) {
-          console.warn(
-            `itemGet before refresh failed for ${item_id}:`,
-            getPlaidErrorData(itemBeforeErr)
-          );
-        }
-
-        const refreshStatus = await triggerTransactionsRefresh(access_token);
-        overallRefreshRequested = overallRefreshRequested || refreshStatus.requested;
-
-        if (!refreshStatus.succeeded) {
-          overallRefreshSucceeded = false;
-          if (refreshStatus.error_code) {
-            overallRefreshErrorCodes.add(refreshStatus.error_code);
-          }
-          if (refreshStatus.error_message) {
-            overallRefreshMessages.push(`${institution_name}: ${refreshStatus.error_message}`);
-          }
-        }
-
-        let refreshResult = {
-          updated: false,
-          timestamp: previousTransactionsUpdate,
-        };
-
-        if (refreshStatus.succeeded) {
-          refreshResult = await waitForTransactionsUpdateAdvance(
-            access_token,
-            previousTransactionsUpdate
-          );
-        }
-
         const accountsResp = await plaidClient.accountsGet({
           access_token,
         });
 
-        const txResp = await fetchTransactionsWithRetry({
-          access_token,
-          start_date: start,
-          end_date: end,
-          maxAttempts: 5,
-          delayMs: 2500,
-        });
+        const syncResp = await fetchTransactionsSyncAll(access_token);
+        const latestTransactions = buildTransactionsFromSync(syncResp);
 
         const accountsWithInstitution = accountsResp.data.accounts.map((acct) => ({
           ...acct,
@@ -545,7 +418,7 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           linked_item_id: item_id,
         }));
 
-        const transactionsWithInstitution = txResp.data.transactions.map((txn) => ({
+        const transactionsWithInstitution = latestTransactions.map((txn) => ({
           ...txn,
           institution_name,
           linked_item_id: item_id,
@@ -558,12 +431,10 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
           item_id,
           institution_name,
           account_count: accountsResp.data.accounts.length,
-          refresh_requested: refreshStatus.requested,
-          refresh_succeeded: refreshStatus.succeeded,
-          refresh_error_code: refreshStatus.error_code,
-          refresh_error_message: refreshStatus.error_message,
-          transactions_update_advanced: refreshResult.updated,
-          last_transactions_update: refreshResult.timestamp,
+          sync_cursor: syncResp.cursor,
+          added_count: syncResp.added.length,
+          modified_count: syncResp.modified.length,
+          removed_count: syncResp.removed.length,
         });
       } catch (itemErr) {
         const errData = getPlaidErrorData(itemErr);
@@ -581,34 +452,19 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
 
     const uniqueAccounts = dedupeAccounts(allAccounts);
     const uniqueTransactions = dedupeTransactions(allTransactions).sort((a, b) => {
-      return new Date(b.date) - new Date(a.date);
+      const aDate = new Date(a.date || 0).getTime();
+      const bDate = new Date(b.date || 0).getTime();
+      return bDate - aDate;
     });
 
     if (uniqueAccounts.length === 0 && itemErrors.length > 0) {
-      const hasProductNotReady = itemErrors.some(
-        (e) => e.error_code === "PRODUCT_NOT_READY"
-      );
-
-      return res.status(hasProductNotReady ? 202 : 500).json({
-        error: hasProductNotReady
-          ? "Transactions are still being prepared. Please refresh again shortly."
-          : "Failed to fetch data",
-        code: hasProductNotReady ? "PRODUCT_NOT_READY" : "FETCH_FAILED",
+      return res.status(500).json({
+        error: "Failed to fetch data",
+        code: "FETCH_FAILED",
         linkedInstitutions,
         itemErrors,
-        refreshStatus: {
-          requested: overallRefreshRequested,
-          succeeded: false,
-          partial: false,
-          errorCodes: Array.from(overallRefreshErrorCodes),
-          messages: overallRefreshMessages,
-        },
-        dateRange: { start, end },
       });
     }
-
-    const hasItemErrors = itemErrors.length > 0;
-    const refreshPartial = hasItemErrors || !overallRefreshSucceeded;
 
     res.json({
       accounts: uniqueAccounts,
@@ -616,13 +472,12 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
       linkedInstitutions,
       itemErrors,
       refreshStatus: {
-        requested: overallRefreshRequested,
-        succeeded: overallRefreshSucceeded && !hasItemErrors,
-        partial: refreshPartial,
-        errorCodes: Array.from(overallRefreshErrorCodes),
-        messages: overallRefreshMessages,
+        requested: true,
+        succeeded: itemErrors.length === 0,
+        partial: itemErrors.length > 0,
+        errorCodes: itemErrors.map((e) => e.error_code),
+        messages: itemErrors.map((e) => `${e.institution_name}: ${e.error_message}`),
       },
-      dateRange: { start, end },
     });
   } catch (err) {
     console.error(
