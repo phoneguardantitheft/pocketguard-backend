@@ -231,6 +231,37 @@ async function fetchTransactionsSyncAllWithRetry(access_token, startingCursor = 
   throw new Error("transactionsSync retry exhausted");
 }
 
+async function fetchFreshAccounts(access_token, institution_name, item_id) {
+  try {
+    const balanceResp = await plaidClient.accountsBalanceGet({
+      access_token,
+    });
+
+    console.log(
+      `[refresh] balances refreshed item=${institution_name} itemId=${item_id} accounts=${balanceResp.data.accounts.length}`
+    );
+
+    return {
+      accounts: balanceResp.data.accounts || [],
+      liveBalanceRefreshSucceeded: true,
+    };
+  } catch (balanceErr) {
+    console.warn(
+      `[refresh] accountsBalanceGet failed for item=${institution_name} itemId=${item_id}, falling back to accountsGet:`,
+      getPlaidErrorData(balanceErr)
+    );
+
+    const accountsResp = await plaidClient.accountsGet({
+      access_token,
+    });
+
+    return {
+      accounts: accountsResp.data.accounts || [],
+      liveBalanceRefreshSucceeded: false,
+    };
+  }
+}
+
 // ---------- Firestore helpers ----------
 async function getLinkedItems(deviceId) {
   const doc = await linkedBanksCollection.doc(deviceId).get();
@@ -470,7 +501,6 @@ app.post("/plaid/exchange_public_token", async (req, res) => {
 
     await setLinkedItems(deviceId, updatedItems);
 
-    // initialize empty sync state for new/relinked item
     await setItemState(deviceId, item_id, {
       cursor: null,
       transactions: [],
@@ -525,9 +555,10 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
         const savedCursor = savedState.cursor || null;
         const savedTransactions = savedState.transactions || [];
 
-        const accountsResp = await plaidClient.accountsGet({
-          access_token,
-        });
+        const {
+          accounts: freshAccounts,
+          liveBalanceRefreshSucceeded,
+        } = await fetchFreshAccounts(access_token, institution_name, item_id);
 
         const syncResp = await fetchTransactionsSyncAllWithRetry(access_token, savedCursor);
 
@@ -547,7 +578,7 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
         totalModified += (syncResp.modified || []).length;
         totalRemoved += (syncResp.removed || []).length;
 
-        const accountsWithInstitution = accountsResp.data.accounts.map((acct) => ({
+        const accountsWithInstitution = freshAccounts.map((acct) => ({
           ...acct,
           institution_name,
           linked_item_id: item_id,
@@ -565,17 +596,18 @@ app.post("/plaid/get_accounts_and_transactions", async (req, res) => {
         linkedInstitutions.push({
           item_id,
           institution_name,
-          account_count: accountsResp.data.accounts.length,
+          account_count: freshAccounts.length,
           previous_cursor: savedCursor,
           next_cursor: syncResp.next_cursor || savedCursor,
           added_count: (syncResp.added || []).length,
           modified_count: (syncResp.modified || []).length,
           removed_count: (syncResp.removed || []).length,
           total_cached_transactions: mergedTransactions.length,
+          live_balance_refresh_succeeded: liveBalanceRefreshSucceeded,
         });
 
         console.log(
-          `[refresh] item=${institution_name} added=${(syncResp.added || []).length} modified=${(syncResp.modified || []).length} removed=${(syncResp.removed || []).length} cached=${mergedTransactions.length}`
+          `[refresh] item=${institution_name} balancesLive=${liveBalanceRefreshSucceeded} added=${(syncResp.added || []).length} modified=${(syncResp.modified || []).length} removed=${(syncResp.removed || []).length} cached=${mergedTransactions.length}`
         );
       } catch (itemErr) {
         const errData = getPlaidErrorData(itemErr);
